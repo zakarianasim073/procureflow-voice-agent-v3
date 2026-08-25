@@ -1,0 +1,356 @@
+<script type="text/x-server-plugin">
+/*
+ * ProcureFlow Voice Agent V3 — Perchance server plugin
+ * Security boundary: owner authentication, tenant binding, validated messages,
+ * proposed actions, explicit confirmation, append-only audit events.
+ *
+ * DEPLOYMENT: replace OWNER_ACCESS_KEY before publishing. Prefer a server-side
+ * secret/environment binding if the Perchance runtime supports one. Never put
+ * a production secret in the client-side script.
+ */
+const OWNER_ACCESS_KEY = "CHANGE_ME_WITH_A_LONG_RANDOM_OWNER_KEY";
+const TENANT_ID = "procureflow-owner";
+const MAGIC = 0x50465633; // PFV3
+const SCHEMA_VERSION = 3;
+const SUPERBLOCK_SIZE = 64;
+const JOURNAL_START = 64 * 1024;
+const MAX_EVENT_BYTES = 32 * 1024;
+const MAX_MESSAGE_BYTES = 48 * 1024;
+const APPROVAL_TTL_MS = 5 * 60 * 1000;
+const authenticated = new Map();
+
+const EVENT = Object.freeze({
+  MIGRATED: "migrated", AUTH_SUCCESS: "auth_success", AUTH_FAILURE: "auth_failure",
+  SESSION_STARTED: "session_started", SESSION_ENDED: "session_ended",
+  USER_TRANSCRIPT: "user_transcript", AGENT_TRANSCRIPT: "agent_transcript",
+  CONTEXT_UPDATED: "context_updated", ACTION_PROPOSED: "action_proposed",
+  ACTION_APPROVED: "action_approved", ACTION_REJECTED: "action_rejected",
+  ACTION_EXECUTED: "action_executed", DATA_UPDATED: "data_updated",
+  SECURITY_EVENT: "security_event"
+});
+
+const TOOL_POLICY = Object.freeze({
+  save_bid_scenario: { risk: "WRITE", confirm: true },
+  change_pipeline_status: { risk: "WRITE", confirm: true },
+  schedule_review: { risk: "WRITE", confirm: true },
+  queue_email_draft: { risk: "EXTERNAL", confirm: true }
+});
+
+const enc = new TextEncoder();
+const dec = new TextDecoder("utf-8", { fatal: false });
+const dv = new DataView(state.buffer, state.byteOffset || 0, state.byteLength);
+
+function invariant(ok, message) { if (!ok) throw new Error(message); }
+function range(offset, length) {
+  invariant(Number.isInteger(offset) && Number.isInteger(length), "Invalid state range");
+  invariant(offset >= 0 && length >= 0 && offset + length <= state.length, "State range exceeded");
+}
+function readU32(offset) { range(offset, 4); return dv.getUint32(offset, true); }
+function writeU32(offset, value) { range(offset, 4); dv.setUint32(offset, value >>> 0, true); }
+function checksum(bytes) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+function id(prefix) {
+  const r = Math.random().toString(36).slice(2, 10);
+  return prefix + "_" + Date.now().toString(36) + "_" + r;
+}
+function safeEqual(a, b) {
+  a = String(a || ""); b = String(b || "");
+  let diff = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) diff |= (a.charCodeAt(i % Math.max(1, a.length)) || 0) ^ (b.charCodeAt(i % Math.max(1, b.length)) || 0);
+  return diff === 0;
+}
+function cleanString(value, max) { return String(value == null ? "" : value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").slice(0, max); }
+
+function initializeOrMigrate() {
+  if (readU32(0) === MAGIC) {
+    const version = readU32(4);
+    invariant(version <= SCHEMA_VERSION, "State was created by a newer plugin");
+    invariant(version === SCHEMA_VERSION, "Unsupported V3 migration step");
+    return;
+  }
+  const legacyVersion = state[0];
+  let legacy = null;
+  if (legacyVersion === 2) legacy = readLegacyV2();
+  else {
+    const blank = state.subarray(0, Math.min(64, state.length)).every(x => x === 0);
+    invariant(blank, "Unknown state format; refusing destructive reset");
+  }
+  state.fill(0);
+  writeU32(0, MAGIC); writeU32(4, SCHEMA_VERSION);
+  writeU32(8, JOURNAL_START); writeU32(12, 0);
+  if (legacy) appendEvent({ type: EVENT.MIGRATED, payload: legacy });
+}
+
+function readLegacyV2() {
+  try {
+    const HEADER = 12, REC = 320, MAX = 40;
+    const dataStart = HEADER + REC * MAX, dataLen = 4000;
+    const outStart = dataStart + 4 + dataLen, outLen = 8000;
+    const schedStart = outStart + 4 + outLen;
+    const readText = (start, cap) => {
+      const n = Math.min(readU32(start), cap, state.length - start - 4);
+      return dec.decode(state.subarray(start + 4, start + 4 + Math.max(0, n)));
+    };
+    const calls = [], write = readU32(1), count = Math.min(readU32(5), MAX);
+    for (let k = 0; k < count; k++) {
+      const idx = ((write - count + k) % MAX + MAX) % MAX, off = HEADER + idx * REC;
+      if (state[off] !== 1) continue;
+      let end = off + 10;
+      while (end < off + REC && state[end] !== 0) end++;
+      calls.push({ ts: readU32(off + 1), text: dec.decode(state.subarray(off + 10, end)) });
+    }
+    return { from: 2, calls, data: readText(dataStart, dataLen), outbox: readText(outStart, outLen), schedule: readText(schedStart, Math.max(0, state.length - schedStart - 4)) };
+  } catch (error) {
+    return { from: 2, warning: "Legacy state could not be fully recovered" };
+  }
+}
+
+function appendEvent(input) {
+  const event = {
+    event_id: input.event_id || id("evt"), sequence: readU32(12) + 1,
+    timestamp_ms: Date.now(), tenant_id: TENANT_ID,
+    actor_id: cleanString(input.actor_id || "system", 100),
+    session_id: cleanString(input.session_id || "", 100),
+    tender_id: cleanString(input.tender_id || "", 100),
+    type: input.type, payload: input.payload || {}
+  };
+  const payload = enc.encode(JSON.stringify(event));
+  invariant(payload.length <= MAX_EVENT_BYTES, "Audit event too large");
+  const recordLength = 9 + payload.length;
+  let offset = readU32(8);
+  if (offset + recordLength > state.length) {
+    compactJournal(); offset = readU32(8);
+    invariant(offset + recordLength <= state.length, "State capacity exhausted");
+  }
+  state[offset] = 0;
+  writeU32(offset + 1, payload.length); writeU32(offset + 5, checksum(payload));
+  state.set(payload, offset + 9); state[offset] = 1;
+  writeU32(8, offset + recordLength); writeU32(12, event.sequence);
+  return event;
+}
+
+function readEvents(limit) {
+  const out = []; let offset = JOURNAL_START, stop = Math.min(readU32(8), state.length);
+  while (offset + 9 <= stop) {
+    if (state[offset] !== 1) break;
+    const n = readU32(offset + 1);
+    if (!n || n > MAX_EVENT_BYTES || offset + 9 + n > stop) break;
+    const bytes = state.subarray(offset + 9, offset + 9 + n);
+    if (checksum(bytes) !== readU32(offset + 5)) break;
+    try { out.push(JSON.parse(dec.decode(bytes))); } catch (_) { break; }
+    offset += 9 + n;
+  }
+  return limit ? out.slice(-limit) : out;
+}
+
+function compactJournal() {
+  const retained = readEvents(700).filter(e => e.type !== EVENT.USER_TRANSCRIPT && e.type !== EVENT.AGENT_TRANSCRIPT).slice(-350);
+  const summaries = readEvents(250).filter(e => e.type === EVENT.USER_TRANSCRIPT || e.type === EVENT.AGENT_TRANSCRIPT).slice(-120);
+  state.fill(0, JOURNAL_START); writeU32(8, JOURNAL_START);
+  const seq = readU32(12); writeU32(12, 0);
+  [...retained, ...summaries].sort((a,b) => a.timestamp_ms - b.timestamp_ms).forEach(e => appendEvent({ ...e, event_id: e.event_id }));
+  writeU32(12, Math.max(seq, readU32(12)));
+}
+
+function requireAuth(conn) {
+  const auth = authenticated.get(conn.id);
+  invariant(auth && auth.expires_at > Date.now(), "AUTH_REQUIRED");
+  return auth;
+}
+function send(conn, body) { conn.send(JSON.stringify(body)); }
+function publish(topic, body) { pubsub.publish(topic, JSON.stringify(body)); }
+function validateAction(raw) {
+  invariant(raw && typeof raw === "object", "Invalid action");
+  const tool = cleanString(raw.tool, 80), policy = TOOL_POLICY[tool];
+  invariant(policy, "Tool is not allowed");
+  const args = raw.arguments && typeof raw.arguments === "object" ? raw.arguments : {};
+  const allowed = {};
+  if (tool === "save_bid_scenario") {
+    allowed.tender_id = cleanString(args.tender_id, 100);
+    allowed.scenario_name = cleanString(args.scenario_name, 120);
+    allowed.discount_percent = cleanString(args.discount_percent, 20);
+    invariant(allowed.tender_id && /^-?\d+(\.\d+)?$/.test(allowed.discount_percent), "Invalid bid scenario");
+  } else if (tool === "change_pipeline_status") {
+    allowed.tender_id = cleanString(args.tender_id, 100);
+    allowed.status = cleanString(args.status, 40).toUpperCase();
+    invariant(allowed.tender_id && ["WATCHING","REVIEW","BID","NO_BID","ARCHIVED"].includes(allowed.status), "Invalid pipeline status");
+  } else if (tool === "schedule_review") {
+    allowed.tender_id = cleanString(args.tender_id, 100);
+    allowed.datetime = cleanString(args.datetime, 40);
+    allowed.topic = cleanString(args.topic, 240);
+    invariant(allowed.datetime && allowed.topic, "Invalid schedule request");
+  } else if (tool === "queue_email_draft") {
+    allowed.to = cleanString(args.to, 254);
+    allowed.subject = cleanString(args.subject, 180);
+    allowed.body = cleanString(args.body, 4000);
+    invariant(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(allowed.to) && allowed.subject && allowed.body, "Invalid email draft");
+  }
+  return { tool, arguments: allowed, risk: policy.risk, requires_confirmation: true };
+}
+function actionLabel(a) {
+  if (a.tool === "save_bid_scenario") return `Save bid scenario for ${a.arguments.tender_id} at ${a.arguments.discount_percent}% discount`;
+  if (a.tool === "change_pipeline_status") return `Change tender ${a.arguments.tender_id} to ${a.arguments.status}`;
+  if (a.tool === "schedule_review") return `Schedule ${a.arguments.topic} for ${a.arguments.datetime}`;
+  if (a.tool === "queue_email_draft") return `Queue email draft to ${a.arguments.to}: ${a.arguments.subject}`;
+  return a.tool;
+}
+function pendingAction(actionId) {
+  const events = readEvents(800);
+  const proposed = [...events].reverse().find(e => e.type === EVENT.ACTION_PROPOSED && e.payload.action_id === actionId);
+  if (!proposed) return null;
+  const decided = events.some(e => [EVENT.ACTION_APPROVED, EVENT.ACTION_REJECTED, EVENT.ACTION_EXECUTED].includes(e.type) && e.payload.action_id === actionId);
+  return decided ? null : proposed;
+}
+function executeApproved(event, auth) {
+  const action = event.payload.action;
+  // Safe adapter boundary: these V3 actions create durable internal records only.
+  // Connect real ProcureFlow APIs here using server-held credentials and idempotency keys.
+  return appendEvent({ type: EVENT.ACTION_EXECUTED, actor_id: auth.actor_id, session_id: event.session_id,
+    tender_id: action.arguments.tender_id || "", payload: { action_id: event.payload.action_id, action, execution_mode: "INTERNAL_DRAFT", idempotency_key: event.payload.action_id } });
+}
+
+initializeOrMigrate();
+
+self.onopen = ({ conn }) => {
+  conn.subscribe("voice-v3");
+  send(conn, { type: "hello", version: 3, authentication_required: true });
+};
+self.onclose = ({ conn }) => authenticated.delete(conn.id);
+self.onmessage = ({ conn, data }) => {
+  try {
+    invariant(typeof data === "string" && enc.encode(data).length <= MAX_MESSAGE_BYTES, "Message too large");
+    const msg = JSON.parse(data);
+    if (msg.type === "authenticate") {
+      if (!safeEqual(msg.access_key, OWNER_ACCESS_KEY) || OWNER_ACCESS_KEY.startsWith("CHANGE_ME")) {
+        appendEvent({ type: EVENT.AUTH_FAILURE, actor_id: conn.id, payload: { reason: "invalid_key" } });
+        return send(conn, { type: "auth_result", ok: false, error: "Invalid or unconfigured owner key" });
+      }
+      const actorId = cleanString(msg.actor_id || "owner", 100);
+      authenticated.set(conn.id, { actor_id: actorId, expires_at: Date.now() + 8 * 60 * 60 * 1000 });
+      appendEvent({ type: EVENT.AUTH_SUCCESS, actor_id: actorId });
+      return send(conn, { type: "auth_result", ok: true, tenant_id: TENANT_ID, recent: readEvents(120) });
+    }
+    const auth = requireAuth(conn);
+    if (msg.type === "event") {
+      invariant([EVENT.SESSION_STARTED, EVENT.SESSION_ENDED, EVENT.USER_TRANSCRIPT, EVENT.AGENT_TRANSCRIPT, EVENT.CONTEXT_UPDATED].includes(msg.event_type), "Event not allowed");
+      const event = appendEvent({ type: msg.event_type, actor_id: auth.actor_id, session_id: cleanString(msg.session_id, 100), tender_id: cleanString(msg.tender_id, 100), payload: msg.payload || {} });
+      publish("voice-v3", { type: "audit_event", event });
+    } else if (msg.type === "context_data") {
+      const event = appendEvent({ type: EVENT.DATA_UPDATED, actor_id: auth.actor_id, payload: { context: msg.context || {} } });
+      publish("voice-v3", { type: "context_data", context: event.payload.context });
+    } else if (msg.type === "propose_action") {
+      const action = validateAction(msg.action), actionId = id("act");
+      const event = appendEvent({ type: EVENT.ACTION_PROPOSED, actor_id: auth.actor_id, session_id: cleanString(msg.session_id, 100), tender_id: action.arguments.tender_id || "", payload: { action_id: actionId, action, label: actionLabel(action), expires_at: Date.now() + APPROVAL_TTL_MS } });
+      send(conn, { type: "approval_required", action_id: actionId, action, label: event.payload.label, expires_at: event.payload.expires_at });
+    } else if (msg.type === "decide_action") {
+      const proposed = pendingAction(cleanString(msg.action_id, 120));
+      invariant(proposed, "Action is missing or already decided");
+      invariant(proposed.actor_id === auth.actor_id, "Action belongs to another actor");
+      invariant(proposed.payload.expires_at >= Date.now(), "Approval expired");
+      if (msg.decision !== "approve") {
+        appendEvent({ type: EVENT.ACTION_REJECTED, actor_id: auth.actor_id, session_id: proposed.session_id, tender_id: proposed.tender_id, payload: { action_id: proposed.payload.action_id } });
+        return send(conn, { type: "action_result", ok: true, status: "rejected", action_id: proposed.payload.action_id });
+      }
+      appendEvent({ type: EVENT.ACTION_APPROVED, actor_id: auth.actor_id, session_id: proposed.session_id, tender_id: proposed.tender_id, payload: { action_id: proposed.payload.action_id, exact_label: proposed.payload.label } });
+      const executed = executeApproved(proposed, auth);
+      send(conn, { type: "action_result", ok: true, status: "executed_as_internal_draft", action_id: proposed.payload.action_id, event: executed });
+    }
+  } catch (error) {
+    send(conn, { type: "error", error: cleanString(error.message || "Request failed", 240) });
+  }
+};
+self.rpc = {
+  recent({ conn }) { requireAuth(conn); return JSON.stringify({ version: 3, events: readEvents(200) }); }
+};
+</script>
+
+<style>
+:root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20334d;--text:#ecf4ff;--muted:#91a5bf;--blue:#2f75ff;--cyan:#32d4c8;--red:#ff626f;--amber:#ffbf47;--green:#35c978}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#16385b 0,transparent 35%),var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,sans-serif}.app{max-width:1180px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}.brand{font-weight:800;font-size:18px}.badge{padding:6px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}.grid{display:grid;grid-template-columns:1.25fr .75fr;gap:18px}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 18px 60px #0006}.agenthead{display:flex;align-items:center;gap:14px}.orb{width:58px;height:58px;border-radius:50%;background:conic-gradient(var(--blue),var(--cyan),var(--blue));box-shadow:0 0 30px #2f75ff55}.status{font-size:18px;font-weight:750}.muted{color:var(--muted)}.toolbar,.row{display:flex;gap:10px;flex-wrap:wrap}.toolbar{margin:16px 0}.chip,button,input,select{border:1px solid var(--line);background:#0a1728;color:var(--text);border-radius:11px;padding:10px 12px}.chip.active,.primary{background:var(--blue);border-color:var(--blue)}button{cursor:pointer;font-weight:700}button:disabled{opacity:.45;cursor:not-allowed}.danger{background:var(--red);border-color:var(--red)}.approve{background:var(--green);border-color:var(--green)}input{flex:1;min-width:160px}.context{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.transcript{height:360px;overflow:auto;background:#071321;border:1px solid var(--line);border-radius:14px;padding:12px}.msg{max-width:86%;padding:10px 12px;border-radius:13px;margin:8px 0;white-space:pre-wrap}.msg.user{margin-left:auto;background:#255fcf}.msg.agent{background:#172940}.who{display:block;font-size:10px;text-transform:uppercase;color:#b9cae0}.evidence{border-left:3px solid var(--cyan);padding:8px 10px;background:#0a2130;margin-top:6px;font-size:12px}.approval{border:1px solid var(--amber);background:#2b210e;border-radius:14px;padding:14px;margin:12px 0}.hidden{display:none!important}.panel h3{margin:0 0 10px}.events{max-height:530px;overflow:auto}.event{border-bottom:1px solid var(--line);padding:9px 0}.risk{color:var(--amber);font-weight:800}.login{max-width:460px;margin:12vh auto}.login input{width:100%;margin:12px 0}.notice{padding:10px;border-radius:10px;background:#281c10;color:#ffd28a;margin-top:12px}@media(max-width:820px){.grid{grid-template-columns:1fr}.context{grid-template-columns:1fr}.app{padding:12px}}
+</style>
+
+<div class="app">
+  <section id="login" class="card login">
+    <div class="brand">ProcureFlow Voice Agent V3</div>
+    <p class="muted">Owner-only workspace. Enter the deployment access key.</p>
+    <input id="ownerKey" type="password" autocomplete="current-password" placeholder="Owner access key">
+    <input id="actorId" value="owner" placeholder="Owner ID">
+    <button class="primary" id="loginBtn">Authenticate</button>
+    <div id="loginMsg" class="notice hidden"></div>
+  </section>
+
+  <main id="workspace" class="hidden">
+    <div class="top"><div><div class="brand">ProcureFlow · Tender Voice Intelligence</div><div class="muted">Facts, evidence and assumptions remain distinct</div></div><div class="badge" id="connection">Connecting…</div></div>
+    <div class="grid">
+      <section class="card">
+        <div class="agenthead"><div class="orb" id="orb"></div><div><div class="status" id="status">Ready</div><div class="muted" id="substatus">Select a tender or ask an intelligence question</div></div></div>
+        <div class="toolbar"><button class="chip active" data-lang="auto">Auto</button><button class="chip" data-lang="en">English</button><button class="chip" data-lang="bn">বাংলা</button><button id="callBtn" class="primary">Start session</button><button id="stopVoice">Stop voice</button></div>
+        <div class="context"><input id="company" placeholder="Company: JJ Traders"><input id="tenderId" placeholder="Tender ID"><select id="workspaceType"><option>Opportunity Intelligence</option><option>Tender Workspace</option><option>BOQ Intelligence</option><option>Pricing Lab</option><option>PPR Compliance</option><option>Evidence Center</option></select><button id="applyContext">Apply context</button></div>
+        <div id="transcript" class="transcript"><div class="muted">Authenticated transcript will appear here.</div></div>
+        <div id="approval" class="approval hidden"><div class="risk">OWNER CONFIRMATION REQUIRED</div><div id="approvalLabel"></div><div class="row" style="margin-top:10px"><button id="approveBtn" class="approve">Confirm exact action</button><button id="rejectBtn" class="danger">Reject</button></div></div>
+        <div class="row" style="margin-top:12px"><button id="micBtn">🎤 Speak</button><input id="textInput" placeholder="Ask about a tender, BOQ, competitor, risk or evidence"><button id="sendBtn" class="primary">Send</button></div>
+      </section>
+      <aside class="card panel"><h3>Evidence & audit</h3><div class="muted">Every answer should cite source, page/section and confidence.</div><div id="events" class="events"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const client = { socket:null, authenticated:false, sessionId:null, language:"auto", listening:false, recognition:null, speaking:false, pending:null, context:{company:"",tender_id:"",workspace:"Tender Workspace"}, history:[], evidence:[], liveContext:{} };
+
+function wsSend(body){ if(!client.socket || client.socket.readyState!==1) throw new Error("Server is not connected"); client.socket.send(JSON.stringify(body)); }
+function setState(title, subtitle){ $("status").textContent=title; if(subtitle!==undefined) $("substatus").textContent=subtitle; }
+function addMessage(role,text,evidence=[]){
+  const wrap=document.createElement("div"); wrap.className="msg "+role;
+  const who=document.createElement("span"); who.className="who"; who.textContent=role; wrap.appendChild(who); wrap.appendChild(document.createTextNode(text));
+  evidence.forEach(e=>{const x=document.createElement("div");x.className="evidence";x.textContent=`Source: ${e.source||"Not supplied"}${e.page?" · p. "+e.page:""}${e.confidence?" · "+e.confidence:""}`;wrap.appendChild(x)});
+  $("transcript").appendChild(wrap); $("transcript").scrollTop=$("transcript").scrollHeight;
+}
+function addAudit(event){const x=document.createElement("div");x.className="event";x.textContent=`${new Date(event.timestamp_ms).toLocaleTimeString()} · ${event.type}${event.tender_id?" · "+event.tender_id:""}`;$("events").prepend(x)}
+function reportEvent(type,payload={}){ if(!client.authenticated)return; wsSend({type:"event",event_type:type,session_id:client.sessionId,tender_id:client.context.tender_id,payload}); }
+
+function connect(){
+  client.socket = new WebSocket(serverUrl);
+  client.socket.onopen=()=>{$("connection").textContent="Server connected"};
+  client.socket.onclose=()=>{$("connection").textContent="Disconnected";client.authenticated=false};
+  client.socket.onmessage=ev=>{let m;try{m=JSON.parse(ev.data)}catch(_){return}handleServer(m)};
+}
+function handleServer(m){
+  if(m.type==="auth_result"){
+    if(!m.ok){$("loginMsg").textContent=m.error;$("loginMsg").classList.remove("hidden");return}
+    client.authenticated=true;$("login").classList.add("hidden");$("workspace").classList.remove("hidden");$("connection").textContent="Owner authenticated";(m.recent||[]).slice(-30).forEach(addAudit);
+  } else if(m.type==="audit_event") addAudit(m.event);
+  else if(m.type==="approval_required") {client.pending=m;$("approvalLabel").textContent=m.label;$("approval").classList.remove("hidden")}
+  else if(m.type==="action_result") {$("approval").classList.add("hidden");addMessage("agent",m.status==="rejected"?"The proposed action was rejected.":"Confirmed. The action was recorded as an internal ProcureFlow draft.");client.pending=null}
+  else if(m.type==="error"){addMessage("agent","Request blocked: "+m.error);setState("Ready","No unsafe action was executed")}
+}
+
+$("loginBtn").onclick=()=>{try{wsSend({type:"authenticate",access_key:$("ownerKey").value,actor_id:$("actorId").value})}catch(e){$("loginMsg").textContent=e.message;$("loginMsg").classList.remove("hidden")}};
+document.querySelectorAll("[data-lang]").forEach(b=>b.onclick=()=>{client.language=b.dataset.lang;document.querySelectorAll("[data-lang]").forEach(x=>x.classList.toggle("active",x===b))});
+$("applyContext").onclick=()=>{client.context={company:$("company").value.trim(),tender_id:$("tenderId").value.trim(),workspace:$("workspaceType").value};reportEvent("context_updated",client.context);addMessage("agent",`Context updated: ${client.context.company||"Owner company"} · ${client.context.tender_id||"No tender selected"} · ${client.context.workspace}`)};
+$("callBtn").onclick=()=>{if(!client.sessionId){client.sessionId="voice_"+Date.now().toString(36);client.history=[];reportEvent("session_started",{language:client.language});$("callBtn").textContent="End session";addMessage("agent","ProcureFlow Voice Intelligence is ready. Ask me about an opportunity, qualification, BOQ, pricing risk or evidence.");speak("ProcureFlow Voice Intelligence is ready.")}else{reportEvent("session_ended",{});client.sessionId=null;stopListening();speechSynthesis.cancel();$("callBtn").textContent="Start session";setState("Session ended","")}};
+
+function systemPrompt(){return `You are ProcureFlow Voice Intelligence for Bangladesh public Works procurement. Respond in the user's language (Bangla, English, or natural mixed Bangla-English). Separate OFFICIAL FACT, EXTRACTED DATA, INFERENCE, USER ASSUMPTION, and MISSING EVIDENCE. Never claim tender submission or approval. Never execute actions. Return ONLY valid JSON with keys: spoken_response (string), evidence (array of {source,page,section,confidence}), proposed_actions (array). Allowed action tools: save_bid_scenario, change_pipeline_status, schedule_review, queue_email_draft. Each proposed action has tool and arguments. Ask for missing evidence instead of inventing it. Context: ${JSON.stringify(client.context)}. Trusted context data: ${JSON.stringify(client.liveContext).slice(0,12000)}.`}
+function parseModelJson(raw){let s=String(raw).trim().replace(/^```(?:json)?/i,"").replace(/```$/,"").trim();const first=s.indexOf("{"),last=s.lastIndexOf("}");if(first<0||last<first)throw new Error("The model did not return structured JSON");const o=JSON.parse(s.slice(first,last+1));if(typeof o.spoken_response!=="string")throw new Error("Invalid structured response");o.evidence=Array.isArray(o.evidence)?o.evidence.slice(0,8):[];o.proposed_actions=Array.isArray(o.proposed_actions)?o.proposed_actions.slice(0,1):[];return o}
+async function ask(text){
+  if(!client.sessionId)$("callBtn").click();addMessage("user",text);client.history.push({role:"user",text});reportEvent("user_transcript",{text:text.slice(0,2000)});setState("Analyzing","Checking tender context and evidence");stopListening();
+  try{const conversation=client.history.slice(-12).map(x=>`${x.role}: ${x.text}`).join("\n");const raw=await root.generateText(systemPrompt()+"\nConversation:\n"+conversation+"\nReturn the next structured response.");const out=parseModelJson(raw);client.history.push({role:"agent",text:out.spoken_response});addMessage("agent",out.spoken_response,out.evidence);reportEvent("agent_transcript",{text:out.spoken_response.slice(0,2000),evidence:out.evidence});speak(out.spoken_response);if(out.proposed_actions[0])wsSend({type:"propose_action",session_id:client.sessionId,action:out.proposed_actions[0]});setState("Ready","Evidence displayed with the response")}
+  catch(e){addMessage("agent","I could not produce a verified structured answer. No action was taken.");setState("Answer blocked",e.message)}
+}
+$("sendBtn").onclick=()=>{const t=$("textInput").value.trim();if(t){$("textInput").value="";ask(t)}};$("textInput").onkeydown=e=>{if(e.key==="Enter")$("sendBtn").click()};
+$("approveBtn").onclick=()=>{if(client.pending)wsSend({type:"decide_action",action_id:client.pending.action_id,decision:"approve"})};$("rejectBtn").onclick=()=>{if(client.pending)wsSend({type:"decide_action",action_id:client.pending.action_id,decision:"reject"})};
+
+function detectedLang(text){if(client.language==="bn")return"bn-BD";if(client.language==="en")return"en-US";return /[\u0980-\u09ff]/.test(text)?"bn-BD":"en-US"}
+function speak(text){if(!window.speechSynthesis)return;stopListening();speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang=detectedLang(text);const voices=speechSynthesis.getVoices();u.voice=voices.find(v=>v.lang.toLowerCase().startsWith(u.lang.slice(0,2).toLowerCase()))||null;u.onstart=()=>{client.speaking=true;setState("Speaking","Tap Stop voice to interrupt")};u.onend=u.onerror=()=>{client.speaking=false;setState("Ready","Listening is available")};speechSynthesis.speak(u)}
+function startListening(){if(!SR||client.speaking)return;stopListening();const r=new SR();client.recognition=r;r.lang=client.language==="bn"?"bn-BD":"en-US";r.interimResults=true;r.continuous=false;r.onstart=()=>{client.listening=true;setState("Listening",r.lang)};r.onresult=e=>{let final="",interim="";for(let i=e.resultIndex;i<e.results.length;i++){const text=e.results[i][0].transcript;if(e.results[i].isFinal)final+=text;else interim+=text}if(interim)$("substatus").textContent=interim;if(final)ask(final)};r.onend=()=>{client.listening=false};r.onerror=()=>{client.listening=false;setState("Microphone unavailable","You can continue by typing")};r.start()}
+function stopListening(){if(client.recognition){try{client.recognition.abort()}catch(_){}client.recognition=null}client.listening=false}
+$("micBtn").onclick=()=>client.listening?stopListening():startListening();$("stopVoice").onclick=()=>{speechSynthesis.cancel();client.speaking=false;setState("Voice stopped","You may speak or type")};
+
+connect();
+</script>
